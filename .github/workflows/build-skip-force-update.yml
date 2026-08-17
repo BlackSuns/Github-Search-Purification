@@ -1,0 +1,248 @@
+name: Build Skip Force Update LSPosed APK
+
+on:
+  push:
+    branches:
+      - tmp/skip-force-update-build
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Generate standalone module project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf skip-force-update-hook
+          mkdir -p skip-force-update-hook/app/src/main/java/com/alphamiao/skipforceupdate
+          mkdir -p skip-force-update-hook/app/src/main/assets
+          mkdir -p skip-force-update-hook/app/src/main/res/values
+
+          cat > skip-force-update-hook/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://api.xposed.info/")
+              }
+          }
+          rootProject.name = "SkipForceUpdateHook"
+          include(":app")
+          EOF
+
+          cat > skip-force-update-hook/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+          }
+          EOF
+
+          cat > skip-force-update-hook/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > skip-force-update-hook/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+          }
+          android {
+              namespace = "com.alphamiao.skipforceupdate"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.alphamiao.skipforceupdate"
+                  minSdk = 23
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          dependencies { compileOnly("de.robv.android.xposed:api:82") }
+          EOF
+
+          cat > skip-force-update-hook/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:allowBackup="false" android:label="@string/app_name" android:supportsRtl="true">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="@string/module_description" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > skip-force-update-hook/app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Skip Force Update Hook</string>
+              <string name="module_description">Intercept target WebView force-update API and return result=false.</string>
+          </resources>
+          EOF
+
+          printf '%s\n' 'com.alphamiao.skipforceupdate.MainHook' > skip-force-update-hook/app/src/main/assets/xposed_init
+
+          cat > skip-force-update-hook/app/src/main/java/com/alphamiao/skipforceupdate/MainHook.java <<'EOF'
+          package com.alphamiao.skipforceupdate;
+
+          import android.net.Uri;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import java.io.ByteArrayInputStream;
+          import java.lang.reflect.Method;
+          import java.nio.charset.StandardCharsets;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.concurrent.ConcurrentHashMap;
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          public final class MainHook implements IXposedHookLoadPackage {
+              private static final String TAG = "[SkipForceUpdate] ";
+              private static final String TARGET_HOST = "nbz.xjkybz.cn";
+              private static final String TARGET_PATH = "/v1/sysmanage-service/sysmanage/versioninfo/checkForceUpdate";
+              private static final String FAKE_JSON = "{\"status\":\"200\",\"message\":null,\"result\":false,\"callback\":null}";
+              private static final Set<Class<?>> HOOKED = Collections.newSetFromMap(new ConcurrentHashMap<Class<?>, Boolean>());
+
+              @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+                  XposedBridge.log(TAG + "loaded in " + lpparam.packageName + " / " + lpparam.processName);
+                  installHooks();
+              }
+
+              private static void installHooks() {
+                  try {
+                      hookMethods(WebViewClient.class);
+                      Method m = WebView.class.getDeclaredMethod("setWebViewClient", WebViewClient.class);
+                      XposedBridge.hookMethod(m, new XC_MethodHook() {
+                          @Override protected void afterHookedMethod(MethodHookParam param) {
+                              Object client = param.args[0];
+                              if (client != null) hookHierarchy(client.getClass());
+                          }
+                      });
+                      XposedBridge.log(TAG + "System WebView hooks installed");
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "install failed: " + t);
+                      XposedBridge.log(t);
+                  }
+              }
+
+              private static void hookHierarchy(Class<?> c) {
+                  while (c != null && WebViewClient.class.isAssignableFrom(c)) {
+                      hookMethods(c);
+                      if (c == WebViewClient.class) break;
+                      c = c.getSuperclass();
+                  }
+              }
+
+              private static void hookMethods(Class<?> c) {
+                  if (c == null || !HOOKED.add(c)) return;
+                  for (Method m : c.getDeclaredMethods()) {
+                      if (!"shouldInterceptRequest".equals(m.getName())) continue;
+                      Class<?>[] p = m.getParameterTypes();
+                      if (p.length != 2 || !WebView.class.isAssignableFrom(p[0])) continue;
+                      if (!(p[1] == String.class || WebResourceRequest.class.isAssignableFrom(p[1]))) continue;
+                      try {
+                          m.setAccessible(true);
+                          XposedBridge.hookMethod(m, INTERCEPT);
+                          XposedBridge.log(TAG + "hooked " + c.getName() + "#" + m.getName());
+                      } catch (Throwable t) {
+                          XposedBridge.log(TAG + "cannot hook " + m + ": " + t);
+                      }
+                  }
+              }
+
+              private static final XC_MethodHook INTERCEPT = new XC_MethodHook() {
+                  @Override protected void beforeHookedMethod(MethodHookParam param) {
+                      String url = extractUrl(param.args);
+                      if (!isTarget(url)) return;
+                      XposedBridge.log(TAG + "intercepted: " + url);
+                      param.setResult(fakeResponse());
+                  }
+              };
+
+              private static String extractUrl(Object[] args) {
+                  if (args == null || args.length < 2 || args[1] == null) return null;
+                  Object r = args[1];
+                  if (r instanceof String) return (String) r;
+                  if (r instanceof WebResourceRequest) {
+                      Uri u = ((WebResourceRequest) r).getUrl();
+                      return u == null ? null : u.toString();
+                  }
+                  return null;
+              }
+
+              private static boolean isTarget(String url) {
+                  if (url == null) return false;
+                  try {
+                      Uri u = Uri.parse(url);
+                      return TARGET_HOST.equalsIgnoreCase(u.getHost()) && TARGET_PATH.equals(u.getPath());
+                  } catch (Throwable ignored) {
+                      return url.contains(TARGET_HOST) && url.contains(TARGET_PATH);
+                  }
+              }
+
+              private static WebResourceResponse fakeResponse() {
+                  Map<String,String> h = new HashMap<>();
+                  h.put("Content-Type", "application/json;charset=UTF-8");
+                  h.put("Cache-Control", "no-store");
+                  return new WebResourceResponse("application/json", "UTF-8", 200, "OK", h,
+                      new ByteArrayInputStream(FAKE_JSON.getBytes(StandardCharsets.UTF_8)));
+              }
+          }
+          EOF
+
+      - name: Build APK
+        working-directory: skip-force-update-hook
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Rename APK
+        run: cp skip-force-update-hook/app/build/outputs/apk/debug/app-debug.apk SkipForceUpdateHook-v1.0.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SkipForceUpdateHook-v1.0
+          path: SkipForceUpdateHook-v1.0.apk
+          if-no-files-found: error
